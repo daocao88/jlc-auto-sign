@@ -6,3 +6,4 @@ retrying==1.3.3
 wheel==0.37.1
 #ddddocr>=1.4.7
 #opencv-python==4.7.0.72
+serverchan_sdk==1.0.6
