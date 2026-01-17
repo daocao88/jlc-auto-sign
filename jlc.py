@@ -30,27 +30,41 @@ def format_nickname(nickname):
         return f"{nickname[0]}{'*' * (len(nickname)-2)}{nickname[-1]}"
 
 def extract_token_from_local_storage(driver):
-    """直接从 localStorage 提取 X-JLC-AccessToken"""
+    """优化 Token 提取逻辑：增加 sessionStorage 提取，扩展关键字"""
     try:
+        # 先从 localStorage 提取
         token = driver.execute_script("return window.localStorage.getItem('X-JLC-AccessToken');")
         if token:
             log(f"✅ 成功从 localStorage 提取 token: {token[:30]}...")
             return token
-        else:
-            log("❌ localStorage 中未找到 X-JLC-AccessToken")
-            alternative_keys = [
-                "x-jlc-accesstoken",
-                "accessToken", 
-                "token",
-                "jlc-token"
-            ]
-            for key in alternative_keys:
-                token = driver.execute_script(f"return window.localStorage.getItem('{key}');")
-                if token:
-                    log(f"✅ 从 localStorage 的 {key} 提取到 token: {token[:30]}...")
-                    return token
+        
+        # 再从 sessionStorage 提取
+        token = driver.execute_script("return window.sessionStorage.getItem('X-JLC-AccessToken');")
+        if token:
+            log(f"✅ 成功从 sessionStorage 提取 token: {token[:30]}...")
+            return token
+        
+        # 扩展更多可能的 Token 关键字
+        alternative_keys = [
+            "x-jlc-accesstoken", "accessToken", "token", "jlc-token",
+            "X-JLC-Token", "x-jlc-token", "JLC-AccessToken", "jlcAccessToken"
+        ]
+        
+        for key in alternative_keys:
+            # 同时检查 localStorage 和 sessionStorage
+            token = driver.execute_script(f"return window.localStorage.getItem('{key}');")
+            if token:
+                log(f"✅ 从 localStorage 的 {key} 提取到 token: {token[:30]}...")
+                return token
+            
+            token = driver.execute_script(f"return window.sessionStorage.getItem('{key}');")
+            if token:
+                log(f"✅ 从 sessionStorage 的 {key} 提取到 token: {token[:30]}...")
+                return token
+        
+        log("❌ 未找到任何 Token")
     except Exception as e:
-        log(f"❌ 从 localStorage 提取 token 失败: {e}")
+        log(f"❌ 提取 Token 失败: {e}")
     
     return None
 
@@ -109,32 +123,36 @@ def extract_secretkey_from_devtools(driver):
     return secretkey
 
 def get_oshwhub_points(driver, account_index):
-    """获取开源平台积分数量"""
-    try:
-        # 获取当前页面的Cookie
-        cookies = driver.get_cookies()
-        cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-        
-        headers = {
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'accept': 'application/json, text/plain, */*',
-            'cookie': cookie_str
-        }
-        
-        # 调用用户信息API获取积分
-        response = requests.get("https://oshwhub.com/api/users", headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            if data and data.get('success'):
-                points = data.get('result', {}).get('points', 0)
-                log(f"账号 {account_index} - 📊 当前积分: {points}")
-                return points
-        
-        log(f"账号 {account_index} - ⚠ 无法获取积分信息")
-        return 0
-    except Exception as e:
-        log(f"账号 {account_index} - ⚠ 获取积分失败: {e}")
-        return 0
+    """获取开源平台积分数量（增加重试机制）"""
+    for attempt in range(3):  # 最多重试3次
+        try:
+            # 获取当前页面的Cookie
+            cookies = driver.get_cookies()
+            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+            
+            headers = {
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'accept': 'application/json, text/plain, */*',
+                'cookie': cookie_str
+            }
+            
+            # 调用用户信息API获取积分
+            response = requests.get("https://oshwhub.com/api/users", headers=headers, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                if data and data.get('success'):
+                    points = data.get('result', {}).get('points', 0)
+                    log(f"账号 {account_index} - 📊 当前积分: {points}")
+                    return points
+            
+            log(f"账号 {account_index} - ⚠ 第 {attempt+1} 次获取积分失败，状态码: {response.status_code if 'response' in locals() else '无'}")
+            time.sleep(2)
+        except Exception as e:
+            log(f"账号 {account_index} - ⚠ 第 {attempt+1} 次获取积分失败: {e}")
+            time.sleep(2)
+    
+    log(f"账号 {account_index} - ⚠ 无法获取积分信息")
+    return 0
 
 class JLCClient:
     """嘉立创 API 客户端"""
@@ -157,21 +175,25 @@ class JLCClient:
         self.sign_status = "未知"  # 签到状态
         
     def send_request(self, url, method='GET'):
-        """发送 API 请求"""
-        try:
-            if method.upper() == 'GET':
-                response = requests.get(url, headers=self.headers, timeout=10)
-            else:
-                response = requests.post(url, headers=self.headers, timeout=10)
-            
-            if response.status_code == 200:
-                return response.json()
-            else:
-                log(f"账号 {self.account_index} - ❌ 请求失败，状态码: {response.status_code}")
-                return None
-        except Exception as e:
-            log(f"账号 {self.account_index} - ❌ 请求异常 ({url}): {e}")
-            return None
+        """发送 API 请求（增加重试）"""
+        for attempt in range(2):
+            try:
+                if method.upper() == 'GET':
+                    response = requests.get(url, headers=self.headers, timeout=15)
+                else:
+                    response = requests.post(url, headers=self.headers, timeout=15)
+                
+                if response.status_code == 200:
+                    return response.json()
+                else:
+                    log(f"账号 {self.account_index} - ❌ 第 {attempt+1} 次请求失败，状态码: {response.status_code}")
+                    time.sleep(3)
+            except Exception as e:
+                log(f"账号 {self.account_index} - ❌ 第 {attempt+1} 次请求异常 ({url}): {e}")
+                time.sleep(3)
+        
+        log(f"账号 {self.account_index} - ❌ 请求最终失败")
+        return None
     
     def get_user_info(self):
         """获取用户信息"""
@@ -328,9 +350,9 @@ def navigate_and_interact_m_jlc(driver, account_index):
     log(f"账号 {account_index} - 在 m.jlc.com 进行交互操作...")
     
     try:
-        WebDriverWait(driver, 12).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         driver.execute_script("window.scrollTo(0, 300);")
-        time.sleep(2)
+        time.sleep(3)
         
         nav_selectors = [
             "//div[contains(text(), '我的')]",
@@ -338,14 +360,19 @@ def navigate_and_interact_m_jlc(driver, account_index):
             "//div[contains(text(), '用户中心')]",
             "//a[contains(@href, 'user')]",
             "//a[contains(@href, 'center')]",
+            "//span[contains(text(), '我的')]",
+            "//button[contains(text(), '我的')]"
         ]
         
         for selector in nav_selectors:
             try:
-                element = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, selector)))
+                element = WebDriverWait(driver, 8).until(EC.element_to_be_clickable((By.XPATH, selector)))
+                # 滚动到元素可见位置
+                driver.execute_script("arguments[0].scrollIntoView(true);", element)
+                time.sleep(1)
                 element.click()
                 log(f"账号 {account_index} - 点击导航元素: {selector}")
-                time.sleep(2)
+                time.sleep(3)
                 break
             except:
                 continue
@@ -353,77 +380,197 @@ def navigate_and_interact_m_jlc(driver, account_index):
         driver.execute_script("window.scrollTo(0, 500);")
         time.sleep(2)
         driver.refresh()
-        time.sleep(5)
+        time.sleep(8)
         
     except Exception as e:
         log(f"账号 {account_index} - 交互操作出错: {e}")
 
 def click_gift_buttons(driver, account_index):
-    """点击7天好礼和月度好礼按钮"""
+    """点击7天好礼和月度好礼按钮（优化选择器）"""
     try:
-        # 等待一秒
-        time.sleep(1)
+        time.sleep(2)
+        
+        # 扩展选择器，增加更多可能的定位方式
+        seven_day_selectors = [
+            '//div[contains(@class, "sign_text__r9zaN")]/span[text()="7天好礼"]',
+            '//span[contains(text(), "7天好礼")]',
+            '//button[contains(text(), "7天好礼")]',
+            '//div[contains(text(), "7天好礼")]'
+        ]
         
         # 尝试点击7天好礼
-        try:
-            seven_day_gift = driver.find_element(By.XPATH, '//div[contains(@class, "sign_text__r9zaN")]/span[text()="7天好礼"]')
-            seven_day_gift.click()
-            log(f"账号 {account_index} - ✅ 成功点击7天好礼")
-            
-            # 等待2秒
-            time.sleep(2)
-            
-            # 刷新页面
-            driver.refresh()
-            
-            # 等待5秒让页面加载完毕
-            time.sleep(5)
-            
-        except Exception as e:
-            log(f"账号 {account_index} - ⚠ 无法点击7天好礼: {e}")
+        for selector in seven_day_selectors:
+            try:
+                seven_day_gift = WebDriverWait(driver, 3).until(
+                    EC.element_to_be_clickable((By.XPATH, selector))
+                )
+                seven_day_gift.click()
+                log(f"账号 {account_index} - ✅ 成功点击7天好礼")
+                time.sleep(3)
+                driver.refresh()
+                time.sleep(5)
+                break
+            except:
+                continue
+        else:
+            log(f"账号 {account_index} - ⚠ 无法点击7天好礼")
         
         # 尝试点击月度好礼
-        try:
-            monthly_gift = driver.find_element(By.XPATH, '//div[contains(@class, "sign_text__r9zaN")]/span[text()="月度好礼"]')
-            monthly_gift.click()
-            log(f"账号 {account_index} - ✅ 成功点击月度好礼")          
-            time.sleep(1)
-            
-        except Exception as e:
-            log(f"账号 {account_index} - ⚠ 无法点击月度好礼: {e}")
+        monthly_selectors = [
+            '//div[contains(@class, "sign_text__r9zaN")]/span[text()="月度好礼"]',
+            '//span[contains(text(), "月度好礼")]',
+            '//button[contains(text(), "月度好礼")]',
+            '//div[contains(text(), "月度好礼")]'
+        ]
+        
+        for selector in monthly_selectors:
+            try:
+                monthly_gift = WebDriverWait(driver, 3).until(
+                    EC.element_to_be_clickable((By.XPATH, selector))
+                )
+                monthly_gift.click()
+                log(f"账号 {account_index} - ✅ 成功点击月度好礼")
+                time.sleep(2)
+                break
+            except:
+                continue
+        else:
+            log(f"账号 {account_index} - ⚠ 无法点击月度好礼")
             
     except Exception as e:
         log(f"账号 {account_index} - ❌ 点击礼包按钮时出错: {e}")
 
 def get_user_nickname_from_api(driver, account_index):
-    """通过API获取用户昵称"""
+    """通过API获取用户昵称（增加重试）"""
+    for attempt in range(3):
+        try:
+            # 获取当前页面的Cookie
+            cookies = driver.get_cookies()
+            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+            
+            headers = {
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'accept': 'application/json, text/plain, */*',
+                'cookie': cookie_str
+            }
+            
+            # 调用用户信息API
+            response = requests.get("https://oshwhub.com/api/users", headers=headers, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                if data and data.get('success'):
+                    nickname = data.get('result', {}).get('nickname', '')
+                    if nickname:
+                        formatted_nickname = format_nickname(nickname)
+                        log(f"账号 {account_index} - 👤 昵称: {formatted_nickname}")
+                        return formatted_nickname
+            
+            log(f"账号 {account_index} - ⚠ 第 {attempt+1} 次获取昵称失败，状态码: {response.status_code}")
+            time.sleep(2)
+        except Exception as e:
+            log(f"账号 {account_index} - ⚠ 第 {attempt+1} 次获取昵称失败: {e}")
+            time.sleep(2)
+    
+    log(f"账号 {account_index} - ⚠ 无法获取用户昵称")
+    return None
+
+def solve_slider_captcha(driver, wait):
+    """优化滑块验证逻辑：兼容更多滑块样式，增加失败处理"""
     try:
-        # 获取当前页面的Cookie
-        cookies = driver.get_cookies()
-        cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+        # 尝试多种滑块选择器
+        slider_selectors = [
+            ".btn_slide",
+            ".nc_iconfont.btn_slide",
+            ".slider-btn",
+            ".captcha-slider-btn"
+        ]
         
-        headers = {
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'accept': 'application/json, text/plain, */*',
-            'cookie': cookie_str
-        }
+        slider = None
+        for selector in slider_selectors:
+            try:
+                slider = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
+                break
+            except:
+                continue
         
-        # 调用用户信息API
-        response = requests.get("https://oshwhub.com/api/users", headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            if data and data.get('success'):
-                nickname = data.get('result', {}).get('nickname', '')
-                if nickname:
-                    formatted_nickname = format_nickname(nickname)
-                    log(f"账号 {account_index} - 👤 昵称: {formatted_nickname}")
-                    return formatted_nickname
+        if not slider:
+            log("⚠ 未找到滑块元素，尝试XPATH定位")
+            slider = wait.until(
+                EC.element_to_be_clickable((By.XPATH, '//div[contains(@class, "slide") and contains(@class, "btn")]'))
+            )
         
-        log(f"账号 {account_index} - ⚠ 无法获取用户昵称")
-        return None
+        # 尝试多种轨道选择器
+        track = None
+        track_selectors = [".nc_scale", ".slider-track", ".captcha-slider-track"]
+        for selector in track_selectors:
+            try:
+                track = driver.find_element(By.CSS_SELECTOR, selector)
+                break
+            except:
+                continue
+        
+        if not track:
+            log("⚠ 未找到轨道元素，使用默认宽度")
+            track_width = 300  # 默认宽度
+        else:
+            track_width = track.size['width']
+        
+        slider_width = slider.size['width']
+        move_distance = track_width - slider_width - random.randint(5, 10)
+        
+        log(f"✅ 检测到滑块验证码，滑动距离: {move_distance}px")
+        
+        # 优化滑动轨迹：模拟人类操作
+        actions = ActionChains(driver)
+        actions.click_and_hold(slider).perform()
+        time.sleep(random.uniform(0.3, 0.5))
+        
+        # 加速阶段
+        quick_steps = int(move_distance * 0.6)
+        for i in range(quick_steps):
+            if i % 8 == 0:
+                time.sleep(random.uniform(0.005, 0.01))
+            actions.move_by_offset(1, random.randint(-1, 1)).perform()
+        
+        time.sleep(random.uniform(0.1, 0.2))
+        
+        # 减速阶段
+        slow_steps = int(move_distance * 0.3)
+        for i in range(slow_steps):
+            if i % 3 == 0:
+                time.sleep(random.uniform(0.01, 0.02))
+            actions.move_by_offset(1, random.randint(-1, 1)).perform()
+        
+        time.sleep(random.uniform(0.1, 0.2))
+        
+        # 微调阶段
+        final_steps = move_distance - quick_steps - slow_steps
+        for i in range(final_steps):
+            time.sleep(random.uniform(0.02, 0.03))
+            actions.move_by_offset(1, 0).perform()
+        
+        # 模拟人类松开前的停顿
+        time.sleep(random.uniform(0.2, 0.3))
+        actions.release().perform()
+        log("✅ 滑块拖动完成，等待验证结果")
+        time.sleep(random.randint(3, 5))
+        
+        # 检查是否验证成功（通过是否出现错误提示判断）
+        try:
+            error_msg = driver.find_element(By.XPATH, '//div[contains(text(), "验证失败") or contains(text(), "滑动错误")]')
+            if error_msg.is_displayed():
+                log(f"❌ 滑块验证失败: {error_msg.text}")
+                return False
+        except:
+            # 未找到错误提示，视为验证成功
+            pass
+        
+        log("✅ 滑块验证成功")
+        return True
+        
     except Exception as e:
-        log(f"账号 {account_index} - ⚠ 获取用户昵称失败: {e}")
-        return None
+        log(f"❌ 滑块验证处理失败: {str(e)[:100]}")
+        return False
 
 def sign_in_account(username, password, account_index, total_accounts, retry_count=0):
     """为单个账号执行完整的签到流程（包含重试机制）"""
@@ -439,14 +586,26 @@ def sign_in_account(username, password, account_index, total_accounts, retry_cou
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
-
+    # 增加防检测配置
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
+    
     caps = DesiredCapabilities.CHROME
     caps['goog:loggingPrefs'] = {'performance': 'ALL'}
+    # 禁用页面加载策略，加快加载速度
+    caps['pageLoadStrategy'] = 'eager'
     
     driver = webdriver.Chrome(options=chrome_options, desired_capabilities=caps)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    # 额外的防检测措施
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": """
+        Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh']});
+        Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+        """
+    })
     
-    wait = WebDriverWait(driver, 25)
+    wait = WebDriverWait(driver, 30)
     
     # 记录详细结果
     result = {
@@ -466,19 +625,20 @@ def sign_in_account(username, password, account_index, total_accounts, retry_cou
         'secretkey_extracted': False,
         'retry_count': retry_count
     }
-
+    
     try:
         # 1. 打开签到页
         driver.get("https://oshwhub.com/sign_in")
         log(f"账号 {account_index} - 已打开 JLC 签到页")
         
-        time.sleep(5 + random.randint(2, 3))
+        time.sleep(random.randint(5, 8))
         current_url = driver.current_url
-
+        
         # 2. 登录流程
         if "passport.jlc.com/login" in current_url:
             log(f"账号 {account_index} - 检测到未登录状态，正在执行登录流程...")
-
+            
+            # 切换账号登录（增加容错）
             try:
                 phone_btn = wait.until(
                     EC.element_to_be_clickable((By.XPATH, '//button[contains(text(),"账号登录")]'))
@@ -487,86 +647,69 @@ def sign_in_account(username, password, account_index, total_accounts, retry_cou
                 log(f"账号 {account_index} - 已切换账号登录")
                 time.sleep(2)
             except Exception as e:
-                log(f"账号 {account_index} - 账号登录按钮可能已默认选中: {e}")
-
-            # 输入账号密码
+                log(f"账号 {account_index} - 账号登录按钮可能已默认选中: {str(e)[:50]}")
+            
+            # 输入账号密码（增加清空和延迟，模拟人类输入）
             try:
                 user_input = wait.until(
                     EC.presence_of_element_located((By.XPATH, '//input[@placeholder="请输入手机号码 / 客户编号 / 邮箱"]'))
                 )
                 user_input.clear()
-                user_input.send_keys(username)
-
+                time.sleep(random.uniform(0.5, 1))
+                # 模拟逐字输入
+                for char in username:
+                    user_input.send_keys(char)
+                    time.sleep(random.uniform(0.05, 0.1))
+                
                 pwd_input = wait.until(
                     EC.presence_of_element_located((By.XPATH, '//input[@type="password"]'))
                 )
                 pwd_input.clear()
-                pwd_input.send_keys(password)
+                time.sleep(random.uniform(0.5, 1))
+                for char in password:
+                    pwd_input.send_keys(char)
+                    time.sleep(random.uniform(0.05, 0.1))
+                
                 log(f"账号 {account_index} - 已输入账号密码")
             except Exception as e:
-                log(f"账号 {account_index} - ❌ 登录输入框未找到: {e}")
+                log(f"账号 {account_index} - ❌ 登录输入框未找到: {str(e)[:50]}")
                 result['oshwhub_status'] = '登录失败'
                 return result
-
+            
             # 点击登录
             try:
                 login_btn = wait.until(
                     EC.element_to_be_clickable((By.CSS_SELECTOR, "button.submit"))
                 )
+                # 滚动到登录按钮可见
+                driver.execute_script("arguments[0].scrollIntoView(true);", login_btn)
+                time.sleep(1)
                 login_btn.click()
                 log(f"账号 {account_index} - 已点击登录按钮")
             except Exception as e:
-                log(f"账号 {account_index} - ❌ 登录按钮定位失败: {e}")
+                log(f"账号 {account_index} - ❌ 登录按钮定位失败: {str(e)[:50]}")
                 result['oshwhub_status'] = '登录失败'
                 return result
-
-            # 处理滑块验证
-            time.sleep(5)
-            try:
-                slider = wait.until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, ".btn_slide"))
-                )
-                
-                track = wait.until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, ".nc_scale"))
-                )
-                
-                track_width = track.size['width']
-                slider_width = slider.size['width']
-                move_distance = track_width - slider_width - 10
-                
-                log(f"账号 {account_index} - 检测到滑块验证码，滑动距离: {move_distance}px")
-                
-                actions = ActionChains(driver)
-                actions.click_and_hold(slider).perform()
-                time.sleep(0.5)
-                
-                # 分段滑动
-                quick_steps = int(move_distance * 0.7)
-                for i in range(quick_steps):
-                    if i % 10 == 0:
-                        time.sleep(0.01)
-                    actions.move_by_offset(1, 0).perform()
-                
-                time.sleep(0.2)
-                
-                slow_steps = move_distance - quick_steps
-                for i in range(slow_steps):
-                    if i % 3 == 0:
-                        time.sleep(0.02)
-                    y_offset = 1 if i % 2 == 0 else -1 if i % 5 == 0 else 0
-                    actions.move_by_offset(1, y_offset).perform()
-                
-                actions.release().perform()
-                log(f"账号 {account_index} - 滑块拖动完成")
-                time.sleep(5)
-                
-            except Exception as e:
-                log(f"账号 {account_index} - 滑块验证处理: {e}")
-
-            # 等待跳转
+            
+            # 处理滑块验证（最多尝试2次）
+            slider_success = False
+            for slider_attempt in range(2):
+                time.sleep(random.randint(3, 5))
+                slider_success = solve_slider_captcha(driver, wait)
+                if slider_success:
+                    break
+                elif slider_attempt < 1:
+                    log(f"🔄 滑块验证失败，第 {slider_attempt+2} 次尝试...")
+                    time.sleep(2)
+            
+            if not slider_success:
+                log(f"❌ 滑块验证最终失败")
+            
+            # 等待跳转（优化逻辑：最多点击2次进入系统按钮）
             log(f"账号 {account_index} - 等待登录跳转...")
-            max_wait = 25
+            max_wait = 30
+            enter_system_click_count = 0
+            
             for i in range(max_wait):
                 current_url = driver.current_url
                 
@@ -575,127 +718,153 @@ def sign_in_account(username, password, account_index, total_accounts, retry_cou
                     log(f"账号 {account_index} - 成功跳转回签到页面")
                     break
                 
-                # 检查是否出现了"进入系统"按钮 - 使用CSS选择器
-                try:
-                    enter_system_btn = driver.find_element(By.CSS_SELECTOR, "button.base-button.w-full.el-button--primary")
-                    log(f"账号 {account_index} - 检测到'进入系统'按钮，正在点击...")
-                    enter_system_btn.click()
-                    log(f"账号 {account_index} - 已点击进入系统按钮，等待跳转...")
-                    time.sleep(5)
-                    
-                    # 点击后再次检查URL
-                    current_url = driver.current_url
-                    if "oshwhub.com" in current_url and "passport.jlc.com" not in current_url:
-                        log(f"账号 {account_index} - 通过进入系统按钮成功跳转")
-                        break
+                # 检查是否出现了"进入系统"按钮（最多点击2次）
+                if enter_system_click_count < 2:
+                    try:
+                        enter_system_btn = WebDriverWait(driver, 2).until(
+                            EC.element_to_be_clickable((By.CSS_SELECTOR, "button.base-button.w-full.el-button--primary"))
+                        )
+                        log(f"账号 {account_index} - 检测到'进入系统'按钮，正在点击（第 {enter_system_click_count+1} 次）...")
+                        enter_system_btn.click()
+                        enter_system_click_count += 1
+                        time.sleep(3)
                         
-                except Exception as e:
-                    # 没有找到进入系统按钮，继续等待
-                    pass
+                        # 点击后再次检查URL
+                        current_url = driver.current_url
+                        if "oshwhub.com" in current_url and "passport.jlc.com" not in current_url:
+                            log(f"账号 {account_index} - 通过进入系统按钮成功跳转")
+                            break
+                            
+                    except:
+                        # 没有找到进入系统按钮，继续等待
+                        pass
                 
-                time.sleep(2)
+                time.sleep(1)
             else:
                 log(f"账号 {account_index} - ⚠ 跳转超时，但继续执行")
-
-            # 额外检查：如果仍然在登录页面，尝试再次点击进入系统
+            
+            # 额外检查：如果仍然在登录页面，尝试刷新
             current_url = driver.current_url
             if "passport.jlc.com" in current_url:
-                log(f"账号 {account_index} - 仍然在登录页面，尝试再次处理...")
+                log(f"账号 {account_index} - 仍然在登录页面，尝试刷新...")
                 try:
-                    # 使用CSS选择器定位进入系统按钮
-                    enter_system_btn = driver.find_element(By.CSS_SELECTOR, "button.base-button.w-full.el-button--primary")
-                    enter_system_btn.click()
-                    log(f"账号 {account_index} - 已点击进入系统按钮")
+                    driver.refresh()
                     time.sleep(5)
+                    log(f"账号 {account_index} - 已刷新页面")
                 except:
-                    # 如果没有进入系统按钮，尝试刷新页面
-                    try:
-                        driver.refresh()
-                        time.sleep(5)
-                        log(f"账号 {account_index} - 已刷新页面")
-                    except:
-                        pass
-
-        # 3. 获取用户昵称
+                    pass
+        
+        # 3. 确保在正确的页面
+        if "oshwhub.com" not in driver.current_url:
+            log(f"账号 {account_index} - 跳转异常，手动跳转到签到页")
+            driver.get("https://oshwhub.com/sign_in")
+            time.sleep(5)
+        
+        # 4. 获取用户昵称
         nickname = get_user_nickname_from_api(driver, account_index)
         if nickname:
             result['nickname'] = nickname
-
-        # 4. 获取签到前积分数量
+        
+        # 5. 获取签到前积分数量
         log(f"账号 {account_index} - 获取签到前积分数量...")
         result['initial_points'] = get_oshwhub_points(driver, account_index)
         log(f"账号 {account_index} - 签到前积分: {result['initial_points']}")
-
-        # 5. 开源平台签到
+        
+        # 6. 开源平台签到（优化签到按钮定位）
         log(f"账号 {account_index} - 等待签到页加载...")
         time.sleep(5)
-
         try:
             driver.refresh()
-            time.sleep(4)
+            time.sleep(5)
         except:
             pass
-
+        
         # 执行开源平台签到
         try:
             # 先检查是否已经签到
-            try:
-                signed_element = driver.find_element(By.XPATH, '//span[contains(text(),"已签到")]')
-                log(f"账号 {account_index} - ✅ 今天已经在开源平台签到过了！")
-                result['oshwhub_status'] = '已签到'
-                result['oshwhub_success'] = True
-                
-                # 即使已签到，也尝试点击礼包按钮
-                log(f"账号 {account_index} - 开始点击礼包按钮...")
-                click_gift_buttons(driver, account_index)
-                
-            except:
-                # 如果没有找到"已签到"元素，则尝试点击"立即签到"按钮
+            signed_selectors = [
+                '//span[contains(text(),"已签到")]',
+                '//div[contains(text(),"已签到")]',
+                '//button[contains(text(),"已签到")]'
+            ]
+            
+            signed = False
+            for selector in signed_selectors:
                 try:
-                    sign_btn = wait.until(
-                        EC.element_to_be_clickable((By.XPATH, '//span[contains(text(),"立即签到")]'))
-                    )
+                    driver.find_element(By.XPATH, selector)
+                    log(f"账号 {account_index} - ✅ 今天已经在开源平台签到过了！")
+                    result['oshwhub_status'] = '已签到'
+                    result['oshwhub_success'] = True
+                    signed = True
+                    break
+                except:
+                    continue
+            
+            if not signed:
+                # 尝试多种签到按钮选择器
+                sign_selectors = [
+                    '//span[contains(text(),"立即签到")]',
+                    '//button[contains(text(),"立即签到")]',
+                    '//div[contains(text(),"立即签到")]',
+                    '//a[contains(text(),"立即签到")]',
+                    '//button[contains(@class, "sign-btn")]',
+                    '//div[contains(@class, "sign-btn")]'
+                ]
+                
+                sign_btn = None
+                for selector in sign_selectors:
+                    try:
+                        sign_btn = wait.until(
+                            EC.element_to_be_clickable((By.XPATH, selector))
+                        )
+                        break
+                    except:
+                        continue
+                
+                if sign_btn:
+                    # 滚动到签到按钮可见
+                    driver.execute_script("arguments[0].scrollIntoView(true);", sign_btn)
+                    time.sleep(1)
                     sign_btn.click()
                     log(f"账号 {account_index} - ✅ 开源平台签到成功！")
                     result['oshwhub_status'] = '签到成功'
                     result['oshwhub_success'] = True
                     
                     # 等待签到完成
-                    time.sleep(2)
+                    time.sleep(random.randint(2, 3))
                     
-                    # 6. 签到完成后点击7天好礼和月度好礼
+                    # 签到完成后点击7天好礼和月度好礼
                     log(f"账号 {account_index} - 开始点击礼包按钮...")
                     click_gift_buttons(driver, account_index)
-                    
-                except Exception as e:
-                    log(f"账号 {account_index} - ❌ 开源平台签到失败，未找到签到按钮: {e}")
+                else:
+                    log(f"账号 {account_index} - ❌ 开源平台签到失败，未找到签到按钮")
                     result['oshwhub_status'] = '签到失败'
                     
         except Exception as e:
-            log(f"账号 {account_index} - ❌ 开源平台签到异常: {e}")
+            log(f"账号 {account_index} - ❌ 开源平台签到异常: {str(e)[:100]}")
             result['oshwhub_status'] = '签到异常'
-
+        
         time.sleep(3)
-
+        
         # 7. 获取签到后积分数量
         log(f"账号 {account_index} - 获取签到后积分数量...")
         result['final_points'] = get_oshwhub_points(driver, account_index)
         log(f"账号 {account_index} - 签到后积分: {result['final_points']}")
-
+        
         # 8. 计算积分差值
         result['points_reward'] = result['final_points'] - result['initial_points']
         if result['points_reward'] > 0:
             log(f"账号 {account_index} - 🎉 总积分增加: {result['initial_points']} → {result['final_points']} (+{result['points_reward']})")
-        elif result['points_reward'] == 0:
+        elif result['points_reward'] == 0 and result['initial_points'] > 0:
             log(f"账号 {account_index} - ⚠ 总积分无变化，可能今天已签到过: {result['initial_points']} → {result['final_points']} (0)")
         else:
             log(f"账号 {account_index} - ❗ 积分减少: {result['initial_points']} → {result['final_points']} ({result['points_reward']})")
-
+        
         # 9. 金豆签到流程
         log(f"账号 {account_index} - 开始金豆签到流程...")
         driver.get("https://m.jlc.com/")
         log(f"账号 {account_index} - 已访问 m.jlc.com，等待页面加载...")
-        time.sleep(10)
+        time.sleep(random.randint(8, 12))
         
         navigate_and_interact_m_jlc(driver, account_index)
         
@@ -725,10 +894,11 @@ def sign_in_account(username, password, account_index, total_accounts, retry_cou
         else:
             log(f"账号 {account_index} - ❌ 无法提取到 token 或 secretkey，跳过金豆签到")
             result['jindou_status'] = 'Token提取失败'
-
+    
     except Exception as e:
-        log(f"账号 {account_index} - ❌ 程序执行错误: {e}")
+        log(f"账号 {account_index} - ❌ 程序执行错误: {str(e)[:100]}")
         result['oshwhub_status'] = '执行异常'
+    
     finally:
         driver.quit()
         log(f"账号 {account_index} - 浏览器已关闭")
@@ -737,7 +907,9 @@ def sign_in_account(username, password, account_index, total_accounts, retry_cou
 
 def should_retry(result):
     """判断是否需要重试：开源平台签到失败或金豆签到失败"""
-    need_retry = (not result['oshwhub_success']) or (not result['jindou_success'])
+    # 只有核心功能失败才重试
+    need_retry = (not result['oshwhub_success'] and result['oshwhub_status'] not in ['已签到', '执行异常']) or \
+                 (not result['jindou_success'] and result['jindou_status'] != '已签到过')
     if need_retry:
         log(f"账号 {result['account_index']} - ⚠ 检测到失败情况，需要重试")
     return need_retry
@@ -754,8 +926,9 @@ def process_single_account(username, password, account_index, total_accounts):
         if not should_retry(result) or attempt >= max_retries:
             break
         else:
-            log(f"账号 {account_index} - 🔄 准备第 {attempt + 1} 次重试，等待 {random.randint(2, 6)} 秒后重新开始...")
-            time.sleep(random.randint(2, 6))
+            wait_time = random.randint(5, 10)
+            log(f"账号 {account_index} - 🔄 准备第 {attempt + 1} 次重试，等待 {wait_time} 秒后重新开始...")
+            time.sleep(wait_time)
     
     return result
 
@@ -784,7 +957,7 @@ def main():
         all_results.append(result)
         
         if i < total_accounts:
-            wait_time = random.randint(3, 5)
+            wait_time = random.randint(5, 8)
             log(f"等待 {wait_time} 秒后处理下一个账号...")
             time.sleep(wait_time)
     
