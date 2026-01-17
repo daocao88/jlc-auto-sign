@@ -1,0 +1,157 @@
+name: 自动更新并保持签到脚本活跃
+
+# 这个脚本用于保持仓库活跃，防止 actions 因为仓库不活跃而自动禁用。
+
+on:
+  schedule:
+    - cron: '0 16 */7 * *'  # 每7天北京时间 0 点触发一次（UTC+8）
+  workflow_dispatch:  # 支持手动触发
+
+permissions:
+  contents: write  # 允许写入仓库内容
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取完整历史，便于 rebase/cherry-pick
+
+      - name: 设置 Git 配置
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config core.autocrlf false
+
+      - name: 添加上游仓库
+        run: |
+          if ! git remote | grep -q upstream; then
+            git remote add upstream https://github.com/zhangMonday/PCBfactory-auto-check-in.git
+          
+          fi
+
+      - name: 切换到 main 分支
+        run: git checkout main
+
+      - name: 获取上游更新
+        run: git fetch upstream
+
+      - name: 检查是否有更新
+        id: check-update
+        run: |
+          if git show-ref --verify --quiet refs/remotes/upstream/main; then
+            UPDATE_COUNT=$(git rev-list --count main..upstream/main 2>/dev/null || echo "0")
+            if [ "$UPDATE_COUNT" -gt 0 ]; then
+              if git diff --quiet main..upstream/main 2>/dev/null; then
+                echo "has_update=false" >> $GITHUB_OUTPUT
+                echo "changes=none" >> $GITHUB_OUTPUT
+              else
+                echo "has_update=true" >> $GITHUB_OUTPUT
+                CHANGES=$(git diff --name-only main..upstream/main 2>/dev/null | tr '\n' ',' | sed 's/,$//' || echo "none")
+                echo "changes=$CHANGES" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "has_update=false" >> $GITHUB_OUTPUT
+              echo "changes=none" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "has_update=false" >> $GITHUB_OUTPUT
+            echo "changes=none" >> $GITHUB_OUTPUT
+            echo "⚠️ 警告：上游 main 分支不存在"
+          fi
+
+      - name: 检查上游更新是否包含 workflow 文件
+        if: steps.check-update.outputs.has_update == 'true'
+        id: check-workflow-update
+        run: |
+          CHANGES="${{ steps.check-update.outputs.changes }}"
+          if echo "$CHANGES" | grep -q '\.github/workflows/'; then
+            echo "has_workflow_update=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_workflow_update=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 拉取上游代码并同步（如果有更新）
+        if: steps.check-update.outputs.has_update == 'true' && steps.check-workflow-update.outputs.has_workflow_update == 'false'
+        run: |
+          echo "正在执行：拉取上游代码并同步"
+          set -e
+
+          ALL_COMMITS=($(git rev-list --reverse main..upstream/main 2>/dev/null))
+          if [ ${#ALL_COMMITS[@]} -eq 0 ]; then
+            echo "没有找到需要同步的提交"
+            exit 0
+          fi
+
+          echo "所有上游更新: ${ALL_COMMITS[*]}"
+
+          NON_EMPTY_COMMITS=()
+          IGNORED_COMMITS=()
+          for commit in "${ALL_COMMITS[@]}"; do
+            msg=$(git log -1 --format=%s $commit)
+            if echo "$msg" | grep -q "保持仓库活跃\|空修改，用于保持仓库活跃"; then
+              IGNORED_COMMITS+=("$commit")
+            else
+              NON_EMPTY_COMMITS+=("$commit")
+            fi
+          done
+
+          echo "要应用的更新: ${NON_EMPTY_COMMITS[*]}"
+          echo "忽略的空更新: ${IGNORED_COMMITS[*]}"
+
+          OLD_TREE=$(git rev-parse HEAD)
+
+          if [ ${#NON_EMPTY_COMMITS[@]} -gt 0 ]; then
+            for commit in "${NON_EMPTY_COMMITS[@]}"; do
+              if git cherry-pick --no-commit $commit; then
+                if git diff --quiet --cached; then
+                  git reset --hard
+                  echo "跳过冗余/空更新 $commit"
+                else
+                  git commit -m "$(git log -1 --format=%s $commit) [$commit]"
+                  echo "✅ 已应用更新 $commit"
+                fi
+              else
+                echo "⚠️ 挑选 $commit 失败（可能冲突），正在中止"
+                git cherry-pick --abort || true
+              fi
+            done
+          fi
+
+          # 如果无实际变化应用，添加空提交保持活跃
+          if [ "$OLD_TREE" = "$(git rev-parse HEAD)" ]; then
+            git commit --allow-empty -m "空修改，用于保持仓库活跃，防止自动签到失效"
+            echo "🟡 无更新，添加空提交保持活跃"
+          fi
+
+          git push origin main || echo "⚠️ push 失败，请检查权限设置"
+          echo "✅ 已成功同步（应用了 ${#NON_EMPTY_COMMITS[@]} 个更新）"
+
+      - name: 提示手动更新（如果上游更新包含 workflow 文件）
+        if: steps.check-update.outputs.has_update == 'true' && steps.check-workflow-update.outputs.has_workflow_update == 'true'
+        run: |
+          echo "⚠️ 上游更新包含 workflow 脚本内容，无法自动更新，请手动同步。"
+          git commit --allow-empty -m "空修改，用于保持仓库活跃，检测到 workflow 更新，请手动同步"
+          git push origin main
+          echo "🟢 已提交空修改保持仓库活跃"
+
+      - name: 提交空修改（如果无更新）
+        if: steps.check-update.outputs.has_update == 'false'
+        run: |
+          echo "🟢 无上游更新，提交空修改保持仓库活跃"
+          git commit --allow-empty -m "空修改，用于保持仓库活跃，防止自动签到失效"
+          git push origin main
+
+      - name: Workflow 总结
+        run: |
+          echo "-----------------------------------------"
+          echo "最终结果：has_update = ${{ steps.check-update.outputs.has_update || '未设置' }}"
+          if [ "${{ steps.check-update.outputs.has_update }}" = "true" ]; then
+            echo "最终结果：has_workflow_update = ${{ steps.check-workflow-update.outputs.has_workflow_update || '未设置' }}"
+          else
+            echo "最终结果：has_workflow_update = 未检查（无更新）"
+          fi
+          echo "-----------------------------------------"
